@@ -229,8 +229,6 @@ $RECYCLE.BIN/
 *.lnk
 
 # Project specific
-# JSONL files (output files)
-*.jsonl
 
 # Elasticsearch data
 data/

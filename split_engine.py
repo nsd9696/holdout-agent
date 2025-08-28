@@ -19,28 +19,129 @@ class SplitSpec:
     min_per_benchmark: int = 0
 
 # ---------- ES search helper (kNN) ----------
-def knn_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, filters: Dict = None) -> List[dict]:
+def knn_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, filters: Dict = None, 
+               min_score: float = 0.0, use_hybrid: bool = False) -> List[dict]:
     """
     Run a kNN search against ES index and return hits with _source and _score.
     The 'filters' parameter is a dict of field -> list_of_values for term filters.
+    
+    Args:
+        es: Elasticsearch client
+        query_vec: Query vector for kNN search
+        k: Number of results to return
+        filters: Field filters (field -> list_of_values)
+        min_score: Minimum score threshold (0.0 = no threshold)
+        use_hybrid: Whether to use hybrid search (kNN + text similarity)
     """
+    # Elasticsearch 제한 준수
+    k = min(10000, k)
+    num_candidates = min(10000, max(2000, k * 3))
     must_filters = []
     if filters:
         for field, vals in filters.items():
             if vals:
                 must_filters.append({"terms": {field: vals}})
-    body = {
-        "knn": {
-            "field": "embedding",
-            "query_vector": query_vec,
-            "k": k,
-            "num_candidates": max(1000, k*2)
-        },
-        "query": {"bool": {"filter": must_filters}} if must_filters else {"match_all": {}},
-        "_source": True
-    }
+    
+    # Score threshold 필터 추가
+    if min_score > 0:
+        must_filters.append({"range": {"_score": {"gte": min_score}}})
+    
+    if use_hybrid:
+        # 하이브리드 검색: kNN + script score
+        body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "script_score": {
+                                "query": {"match_all": {}},
+                                "script": {
+                                    "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+                                    "params": {"query_vector": query_vec}
+                                }
+                            }
+                        }
+                    ],
+                    "filter": must_filters
+                }
+            },
+            "size": k,  # 이미 제한된 k 값 사용
+            "_source": True
+        }
+    else:
+        # 기존 kNN 검색 (개선된 버전)
+        body = {
+            "knn": {
+                "field": "embedding",
+                "query_vector": query_vec,
+                "k": k,
+                "num_candidates": num_candidates
+            },
+            "query": {"bool": {"filter": must_filters}} if must_filters else {"match_all": {}},
+            "_source": True,
+            "min_score": min_score  # Elasticsearch 8.x+ 지원
+        }
+    
     resp = es.search(index=ES_INDEX, body=body)
     return resp["hits"]["hits"]
+
+def knn_search_with_threshold(es: Elasticsearch, query_vec: List[float], k: int = 2000, 
+                             filters: Dict = None, min_score: float = 0.0) -> List[dict]:
+    """
+    Run kNN search with score threshold filtering
+    """
+    return knn_search(es, query_vec, k, filters, min_score, use_hybrid=False)
+
+def hybrid_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, 
+                 filters: Dict = None) -> List[dict]:
+    """
+    Combine kNN with text-based search for better coverage
+    """
+    return knn_search(es, query_vec, k, filters, min_score=0.0, use_hybrid=True)
+
+def multi_stage_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, 
+                      filters: Dict = None) -> List[dict]:
+    """
+    Multi-stage search: first get many candidates, then filter and re-rank
+    """
+    # Stage 1: Get many candidates with relaxed constraints
+    stage1_filters = filters.copy() if filters else {}
+    
+    # Remove strict filters for initial search
+    if 'benchmark' in stage1_filters and len(stage1_filters['benchmark']) > 2:
+        stage1_filters['benchmark'] = stage1_filters['benchmark'][:2]  # Limit to 2 benchmarks
+    
+    candidates = knn_search(es, query_vec, k=k*5, filters=stage1_filters)
+    
+    if len(candidates) < k:
+        # Stage 2: Fallback to broader search
+        print(f"Stage 1 returned only {len(candidates)} candidates, trying broader search...")
+        candidates = knn_search(es, query_vec, k=k*10, filters=None)
+    
+    return candidates[:k]
+
+def adaptive_knn_search(es: Elasticsearch, query_vec: List[float], target_k: int = 2000, 
+                       filters: Dict = None, min_candidates: int = 1000) -> List[dict]:
+    """
+    Adaptively adjust k to ensure minimum number of candidates
+    """
+    current_k = target_k
+    max_attempts = 5
+    
+    for attempt in range(max_attempts):
+        hits = knn_search(es, query_vec, k=current_k, filters=filters)
+        
+        if len(hits) >= min_candidates:
+            print(f"✅ Found {len(hits)} candidates with k={current_k}")
+            return hits
+        
+        # Increase k exponentially
+        current_k = int(current_k * 1.5)
+        print(f"⚠️  Attempt {attempt + 1}: Only {len(hits)} candidates, increasing k to {current_k}")
+    
+    # Final attempt with very large k
+    print(f"🔄 Final attempt with k={current_k}")
+    return knn_search(es, query_vec, k=current_k, filters=filters)
 
 # ---------- balancing & sampling ----------
 def compute_target_counts(total: int, difficulty_mix: Dict[int, float]) -> Dict[int, int]:
@@ -163,11 +264,38 @@ def plan_split(es: Elasticsearch, query_vec: List[float], spec: SplitSpec) -> Tu
      - guarded against leakage (no same (benchmark,id) in both sets),
      - balanced across benchmarks (avoid single-benchmark dominance).
     """
-    hits = knn_search(es, query_vec, k=max(2000, spec.total*10), filters={
-        "benchmark": spec.benchmarks or []
-    })
-    print("selected candidates")
-    candidates = select_candidates(hits, spec, max_candidates=spec.total * 4, query_vec=query_vec)
+    # 즉시 적용: 더 많은 후보 검색 (Elasticsearch 제한 준수)
+    search_k = min(10000, max(5000, spec.total * 15))  # 15배로 증가하되 10000 제한
+    print(f"Searching for candidates with target total: {spec.total}, search_k: {search_k}")
+    
+    # 단기 개선: Threshold 기반 검색 시도
+    min_score = 0.1  # 최소 점수 임계값
+    hits = knn_search_with_threshold(es, query_vec, k=search_k, 
+                                    filters={"benchmark": spec.benchmarks or []}, 
+                                    min_score=min_score)
+    
+    print(f"Found {len(hits)} initial candidates with threshold {min_score}")
+    
+    if len(hits) < spec.total * 2:
+        print(f"⚠️  Warning: Only {len(hits)} candidates found, trying hybrid search...")
+        # 하이브리드 검색 시도
+        hits = hybrid_search(es, query_vec, k=search_k, filters={"benchmark": spec.benchmarks or []})
+        print(f"Hybrid search returned {len(hits)} candidates")
+        
+        if len(hits) < spec.total * 2:
+            print(f"⚠️  Still insufficient candidates, trying multi-stage search...")
+            # 장기 개선: Multi-stage 검색 시도
+            hits = multi_stage_search(es, query_vec, k=search_k, filters={"benchmark": spec.benchmarks or []})
+            print(f"Multi-stage search returned {len(hits)} candidates")
+            
+            if len(hits) < spec.total * 2:
+                print(f"⚠️  Final fallback: adaptive search...")
+                # 최종 수단: Adaptive 검색
+                hits = adaptive_knn_search(es, query_vec, target_k=search_k, 
+                                        filters={"benchmark": spec.benchmarks or []}, 
+                                        min_candidates=spec.total * 2)
+    
+    candidates = select_candidates(hits, spec, max_candidates=spec.total * 6, query_vec=query_vec)
 
     # compute per-difficulty target counts
     target_counts = compute_target_counts(spec.total, spec.difficulty_mix)

@@ -4,7 +4,7 @@
 import os
 
 # Elasticsearch connection settings - read from env
-ES_ENDPOINT = os.getenv("ES_ENDPOINT", "http://localhost:9200")
+ES_ENDPOINT = os.getenv("ES_ENDPOINT", "http://localhost:9201")
 ES_USER = os.getenv("ES_USER", "elastic")
 ES_PASS = os.getenv("ES_PASS", "changeme")
 ES_INDEX = os.getenv("ES_INDEX", "llm_bench_rows")
@@ -23,7 +23,12 @@ BULK_BATCH = int(os.getenv("BULK_BATCH", 256))
 DEFAULT_SPLIT = os.getenv("DEFAULT_SPLIT", "validation")
 
 # Topic relevance threshold for embedding-based filtering (0.0 to 1.0)
-TOPIC_RELEVANCE_THRESHOLD = float(os.getenv("TOPIC_RELEVANCE_THRESHOLD", "0.3"))
+TOPIC_RELEVANCE_THRESHOLD = float(os.getenv("TOPIC_RELEVANCE_THRESHOLD", "0.1"))
+
+# Search configuration for better candidate retrieval
+SEARCH_MIN_SCORE_THRESHOLD = float(os.getenv("SEARCH_MIN_SCORE_THRESHOLD", "0.1"))
+SEARCH_FALLBACK_MULTIPLIER = float(os.getenv("SEARCH_FALLBACK_MULTIPLIER", "1.5"))
+SEARCH_MAX_ATTEMPTS = int(os.getenv("SEARCH_MAX_ATTEMPTS", "5"))
 
 # Task name to HuggingFace repository mapping with split and subset info
 TASK_REPO_MAPPING = [
@@ -51,9 +56,21 @@ TASK_REPO_MAPPING = [
         "split": "train",
         "subset": None
     },
+    {
+        "task_name": "gsm8k",
+        "huggingface_repo": "openai/gsm8k",
+        "split": "test",
+        "subset": None
+    },
+    {
+        "task_name": "ai2_arc",
+        "huggingface_repo": "allenai/ai2_arc",
+        "split": "test",
+        "subset": None
+    }
 ]
 
 # default LM-EVAL tasks to ingest (including kmmlu)
-DEFAULT_TASKS = ["hellaswag", "arc_challenge", "mmlu", "kmmlu"]
+DEFAULT_TASKS = ["hellaswag", "arc_challenge", "mmlu", "kmmlu", "gsm8k"]
 
 
