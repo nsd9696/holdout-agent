@@ -55,6 +55,7 @@ def create_index_if_not_exists(es_client, index_name=None):
                         "index": True,
                         "similarity": "cosine"
                     },
+                    "raw_example": {"type": "flattened"},
                     "difficulty": {"type": "integer"},
                     "relevance_hint": {"type": "float"},
                     "embedding": {

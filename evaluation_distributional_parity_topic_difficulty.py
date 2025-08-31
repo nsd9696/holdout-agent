@@ -141,16 +141,35 @@ def pca_ks_tests(X_in: np.ndarray, X_out: np.ndarray, topk: int = 10) -> dict:
     Holm–Bonferroni correction across K tests.
     """
     X = np.vstack([X_in, X_out])
-    pca = PCA(n_components=min(topk, X.shape[1]))
+    
+    # Ensure n_components is valid for the data
+    max_components = min(X.shape[0] - 1, X.shape[1], topk)
+    if max_components <= 0:
+        return {
+            "KS_rejects_topk": 0,
+            "KS_min_p": 1.0,
+            "KS_med_p": 1.0,
+        }
+    
+    pca = PCA(n_components=max_components)
     Z = pca.fit_transform(X)
     Zi = Z[: len(X_in)]
     Zo = Z[len(X_in) :]
+    
     pvals = []
     for k in range(Zi.shape[1]):
         _, p = ks_2samp(Zi[:, k], Zo[:, k], alternative="two-sided", method="auto")
         pvals.append(p)
+    
     # Holm–Bonferroni
     m = len(pvals)
+    if m == 0:
+        return {
+            "KS_rejects_topk": 0,
+            "KS_min_p": 1.0,
+            "KS_med_p": 1.0,
+        }
+    
     order = np.argsort(pvals)
     holm_rejects = 0
     adj_pvals = [None] * m
@@ -159,6 +178,7 @@ def pca_ks_tests(X_in: np.ndarray, X_out: np.ndarray, topk: int = 10) -> dict:
         adj_pvals[idx] = min(adj, 1.0)
         if adj_pvals[idx] < 0.05:
             holm_rejects += 1
+    
     return {
         "KS_rejects_topk": int(holm_rejects),
         "KS_min_p": float(np.min(pvals)),
@@ -174,12 +194,31 @@ def parity_per_benchmark(df: pd.DataFrame, embs: np.ndarray, topk_pcs: int = 10)
         go = g[g["split"] == "held-out"]
         if len(gi) == 0 or len(go) == 0:
             continue
+        
+        # Check if we have enough samples for meaningful analysis
+        if len(gi) < 2 or len(go) < 2:
+            print(f"⚠️  Warning: Insufficient samples for {bench} (held-in: {len(gi)}, held-out: {len(go)})")
+            continue
+        
         Xi = embs[gi["__idx__"]]
         Xo = embs[go["__idx__"]]
+        
+        # Check if we have enough features
+        if Xi.shape[1] < 2 or Xo.shape[1] < 2:
+            print(f"⚠️  Warning: Insufficient features for {bench} (held-in: {Xi.shape[1]}, held-out: {Xo.shape[1]})")
+            continue
+        
         mu_i, mu_o = Xi.mean(0), Xo.mean(0)
         Si, So = np.cov(Xi.T), np.cov(Xo.T)
+        
+        # Check if covariance matrices are valid
+        if not (np.isfinite(Si).all() and np.isfinite(So).all()):
+            print(f"⚠️  Warning: Invalid covariance matrices for {bench}")
+            continue
+        
         fid = fid_distance(mu_i, Si, mu_o, So)
         ks_stats = pca_ks_tests(Xi, Xo, topk=topk_pcs)
+        
         rows.append({
             "Benchmark": bench,
             "n_in": len(gi),

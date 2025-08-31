@@ -23,10 +23,10 @@ BULK_BATCH = int(os.getenv("BULK_BATCH", 256))
 DEFAULT_SPLIT = os.getenv("DEFAULT_SPLIT", "validation")
 
 # Topic relevance threshold for embedding-based filtering (0.0 to 1.0)
-TOPIC_RELEVANCE_THRESHOLD = float(os.getenv("TOPIC_RELEVANCE_THRESHOLD", "0.1"))
+TOPIC_RELEVANCE_THRESHOLD = float(os.getenv("TOPIC_RELEVANCE_THRESHOLD", "0.01"))
 
 # Search configuration for better candidate retrieval
-SEARCH_MIN_SCORE_THRESHOLD = float(os.getenv("SEARCH_MIN_SCORE_THRESHOLD", "0.1"))
+SEARCH_MIN_SCORE_THRESHOLD = float(os.getenv("SEARCH_MIN_SCORE_THRESHOLD", "0.01"))
 SEARCH_FALLBACK_MULTIPLIER = float(os.getenv("SEARCH_FALLBACK_MULTIPLIER", "1.5"))
 SEARCH_MAX_ATTEMPTS = int(os.getenv("SEARCH_MAX_ATTEMPTS", "5"))
 

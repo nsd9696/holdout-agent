@@ -52,7 +52,7 @@ def normalize_example(ex: dict) -> dict:
         text = "\n".join(text_items) if text_items else str(ex)
 
     answer = ex.get("answer") or ex.get("label") or ex.get("target") or ""
-    return {"text": text, "answer": str(answer)}
+    return {"text": text, "answer": str(answer), "raw_example": ex}
 
 def ingest_task(es_client, task_name: str, split: str = None, subset: str = None):
     """
@@ -93,7 +93,6 @@ def ingest_task(es_client, task_name: str, split: str = None, subset: str = None
         
         # Generate topic embedding for topic-based filtering
         topic_emb = embed_text(meta["topic"])
-        
         doc = {
             "benchmark": task_name,
             "subset": ex.get("subject") or ex.get("category") or subset_to_use,
@@ -104,6 +103,7 @@ def ingest_task(es_client, task_name: str, split: str = None, subset: str = None
             "topic": meta["topic"],
             "topic_embedding": topic_emb,  # Add topic embedding for relevance filtering
             "difficulty": meta["difficulty"],
+            "raw_example": norm["raw_example"],
             "embedding": emb
         }
         doc_id = row_id(task_name, doc["subset"], doc["id_in_benchmark"])
@@ -112,7 +112,6 @@ def ingest_task(es_client, task_name: str, split: str = None, subset: str = None
         if len(actions) >= BULK_BATCH:
             helpers.bulk(es_client, actions)
             actions = []
-
     if actions:
         helpers.bulk(es_client, actions)
 

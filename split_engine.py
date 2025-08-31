@@ -6,7 +6,7 @@ import math, random, orjson
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, asdict
 from elasticsearch import Elasticsearch
-from config import ES_INDEX, TOPIC_RELEVANCE_THRESHOLD
+from config import ES_INDEX, TOPIC_RELEVANCE_THRESHOLD, SEARCH_MIN_SCORE_THRESHOLD
 
 @dataclass
 class SplitSpec:
@@ -36,18 +36,19 @@ def knn_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, filters
     # Elasticsearch 제한 준수
     k = min(10000, k)
     num_candidates = min(10000, max(2000, k * 3))
-    must_filters = []
-    if filters:
-        for field, vals in filters.items():
-            if vals:
-                must_filters.append({"terms": {field: vals}})
-    
-    # Score threshold 필터 추가
-    if min_score > 0:
-        must_filters.append({"range": {"_score": {"gte": min_score}}})
     
     if use_hybrid:
         # 하이브리드 검색: kNN + script score
+        must_filters = []
+        if filters:
+            for field, vals in filters.items():
+                if vals:
+                    must_filters.append({"terms": {field: vals}})
+        
+        # Score threshold 필터 추가
+        if min_score > 0:
+            must_filters.append({"range": {"_score": {"gte": min_score}}})
+        
         body = {
             "query": {
                 "bool": {
@@ -65,11 +66,11 @@ def knn_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, filters
                     "filter": must_filters
                 }
             },
-            "size": k,  # 이미 제한된 k 값 사용
+            "size": k,
             "_source": True
         }
     else:
-        # 기존 kNN 검색 (개선된 버전)
+        # 방법 1: kNN 검색을 먼저 실행하고, 필터링은 후처리로
         body = {
             "knn": {
                 "field": "embedding",
@@ -77,9 +78,7 @@ def knn_search(es: Elasticsearch, query_vec: List[float], k: int = 2000, filters
                 "k": k,
                 "num_candidates": num_candidates
             },
-            "query": {"bool": {"filter": must_filters}} if must_filters else {"match_all": {}},
-            "_source": True,
-            "min_score": min_score  # Elasticsearch 8.x+ 지원
+            "_source": True
         }
     
     resp = es.search(index=ES_INDEX, body=body)
@@ -217,7 +216,7 @@ def select_candidates(hits: List[dict], spec: SplitSpec, max_candidates: int, qu
                 # If no topic embedding available, skip topic filtering
                 pass
         
-        # Keep only essential fields to reduce memory usage
+        # Keep essential fields including raw_example for complete data preservation
         essential_src = {
             "benchmark": src.get("benchmark"),
             "subset": src.get("subset"),
@@ -227,7 +226,8 @@ def select_candidates(hits: List[dict], spec: SplitSpec, max_candidates: int, qu
             "answer": src.get("answer"),
             "topic": src.get("topic"),
             "difficulty": src.get("difficulty"),
-            "topic_relevance": src.get("topic_relevance", 0.0)
+            "topic_relevance": src.get("topic_relevance", 0.0),
+            "raw_example": src.get("raw_example")  # Include raw_example for complete data
         }
         
         pool.append({**essential_src, "_score": h["_score"]})
@@ -268,32 +268,109 @@ def plan_split(es: Elasticsearch, query_vec: List[float], spec: SplitSpec) -> Tu
     search_k = min(10000, max(5000, spec.total * 15))  # 15배로 증가하되 10000 제한
     print(f"Searching for candidates with target total: {spec.total}, search_k: {search_k}")
     
-    # 단기 개선: Threshold 기반 검색 시도
-    min_score = 0.1  # 최소 점수 임계값
-    hits = knn_search_with_threshold(es, query_vec, k=search_k, 
-                                    filters={"benchmark": spec.benchmarks or []}, 
-                                    min_score=min_score)
+        # 4-stage filtering based split
+    print(f"🔍 Starting 4-stage filtering based split...")
     
-    print(f"Found {len(hits)} initial candidates with threshold {min_score}")
+    # Stage 1: Benchmark filtering (mapping based)
+    print(f"📊 Stage 1: Benchmark filtering (mapping based)...")
     
-    if len(hits) < spec.total * 2:
-        print(f"⚠️  Warning: Only {len(hits)} candidates found, trying hybrid search...")
-        # 하이브리드 검색 시도
-        hits = hybrid_search(es, query_vec, k=search_k, filters={"benchmark": spec.benchmarks or []})
-        print(f"Hybrid search returned {len(hits)} candidates")
+    # Use Elasticsearch mapping data based keyword search
+    if spec.benchmarks:
+        # Use term query with benchmark filter
+        body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"terms": {"benchmark": spec.benchmarks}}
+                    ]
+                }
+            },
+            "size": search_k,
+            "_source": True
+        }
+        print(f"🔍 Searching with benchmark filter: {spec.benchmarks}")
+    else:
+        # No benchmark restriction, search all data
+        body = {
+            "query": {"match_all": {}},
+            "size": search_k,
+            "_source": True
+        }
+        print(f"ℹ️  No benchmark restriction, searching all data")
+    
+    resp = es.search(index=ES_INDEX, body=body)
+    hits = resp["hits"]["hits"]
+    print(f"✅ Benchmark mapping based search result: {len(hits)} candidates")
+    
+    # Check benchmark distribution
+    benchmark_counts = {}
+    for hit in hits:
+        benchmark = hit["_source"].get("benchmark", "unknown")
+        benchmark_counts[benchmark] = benchmark_counts.get(benchmark, 0) + 1
+    
+    print(f"📊 Benchmark distribution: {benchmark_counts}")
+    
+    # Stage 2: Topic based hybrid_search filtering
+    if spec.topics and query_vec:
+        print(f"🏷️  Stage 2: Topic based hybrid_search filtering...")
+        topic_hits = hybrid_search(es, query_vec, k=search_k, filters=None)
         
-        if len(hits) < spec.total * 2:
-            print(f"⚠️  Still insufficient candidates, trying multi-stage search...")
-            # 장기 개선: Multi-stage 검색 시도
-            hits = multi_stage_search(es, query_vec, k=search_k, filters={"benchmark": spec.benchmarks or []})
-            print(f"Multi-stage search returned {len(hits)} candidates")
-            
-            if len(hits) < spec.total * 2:
-                print(f"⚠️  Final fallback: adaptive search...")
-                # 최종 수단: Adaptive 검색
-                hits = adaptive_knn_search(es, query_vec, target_k=search_k, 
-                                        filters={"benchmark": spec.benchmarks or []}, 
-                                        min_candidates=spec.total * 2)
+        # Filter by topic relevance
+        topic_filtered = []
+        for hit in topic_hits:
+            src = hit["_source"]
+            topic_emb = src.get("topic_embedding")
+            if topic_emb:
+                max_relevance = max(
+                    compute_topic_relevance(query_vec, topic_emb),
+                    0.0
+                )
+                if max_relevance >= TOPIC_RELEVANCE_THRESHOLD:
+                    topic_filtered.append(hit)
+        
+        # Use topic filtering result if it provides more candidates
+        if len(topic_filtered) > len(hits):
+            hits = topic_filtered
+            print(f"✅ After topic filtering: {len(hits)} candidates")
+        else:
+            print(f"ℹ️  Topic filtering result has fewer candidates, keeping existing result: {len(hits)} candidates")
+    
+    # Stage 3: Goal based hybrid_search filtering
+    print(f"🎯 Stage 3: Goal based hybrid_search filtering...")
+    goal_hits = hybrid_search(es, query_vec, k=search_k, filters=None)
+    
+    # Determine text similarity to goal using simple keyword matching
+    goal_filtered = []
+    for hit in goal_hits:
+        # Determine similarity between goal and text using simple keyword matching
+        text = hit["_source"].get("text", "").lower()
+        if any(keyword in text for keyword in spec.goal.lower().split()):
+            goal_filtered.append(hit)
+    
+    # Use goal filtering result if it provides more candidates
+    if len(goal_filtered) > len(hits):
+        hits = goal_filtered
+        print(f"✅ After goal filtering: {len(hits)} candidates")
+    else:
+        print(f"ℹ️  Goal filtering result has fewer candidates, keeping existing result: {len(hits)} candidates")
+    
+    # Stage 4: Difficulty based filtering
+    print(f"📈 Stage 4: Difficulty based filtering...")
+    difficulty_filtered = []
+    target_difficulties = list(spec.difficulty_mix.keys())
+    
+    for hit in hits:
+        difficulty = hit["_source"].get("difficulty", 3)
+        if int(difficulty) in target_difficulties:
+            difficulty_filtered.append(hit)
+    
+    if len(difficulty_filtered) > 0:
+        hits = difficulty_filtered
+        print(f"✅ After difficulty filtering: {len(hits)} candidates")
+    else:
+        print(f"⚠️  No difficulty filtering result, keeping existing result: {len(hits)} candidates")
+    
+    print(f"🎉 Final filtering completed: {len(hits)} candidates")
     
     candidates = select_candidates(hits, spec, max_candidates=spec.total * 6, query_vec=query_vec)
 
